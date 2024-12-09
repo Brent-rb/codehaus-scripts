@@ -2,77 +2,57 @@
 /* eslint-disable prefer-destructuring */
 import { input } from "@inquirer/prompts"
 import { Args, Command, Flags } from "@oclif/core"
-import { Dirent, existsSync, lstatSync, opendirSync, rename } from "node:fs"
+import { existsSync, lstatSync } from "node:fs"
 import path from "node:path"
 
-import { Ffmpeg } from "../../cli-wrappers/ffmpeg.js"
+import { Mp3Model } from "../../models/mp3-model.js"
+import { Result } from "../../models/result.js"
 
-async function renameFile(filePath: string) {
-	const mp3Info = Ffmpeg.getMp3Info(filePath)
-	if (mp3Info.artist === "" || mp3Info.title === "") {
-		return false
-	}
-
-	const dirname = path.dirname(filePath)
-
-	const newFileName = `${dirname}/${mp3Info.artist} - ${mp3Info.title}.mp3`
-	if (newFileName !== filePath) {
-		await rename(filePath, newFileName, () => {})
-	}
-}
-
-async function renameFileManual(filePath: string) {
-	const mp3Info = Ffmpeg.getMp3Info(filePath)
-	if (mp3Info.artist !== "" && mp3Info.title !== "") {
-		return
-	}
-
-	let artist: string = mp3Info.artist
-	let title: string = mp3Info.title
-
-	console.log(`file: ${filePath} is incomplete, please enter info manually.`)
-	if (artist === "") {
-		artist = await input({ message: "Enter artist: " })
-	}
-
-	if (title === "") {
-		title = await input({ message: "Enter title: " })
-	}
-
-	const dirname = path.dirname(filePath)
-	const newFileName = `${dirname}/${artist} - ${title}.mp3`
-	if (newFileName !== filePath) {
-		await rename(filePath, newFileName, () => {})
-	}
-}
-
-async function renameDir(dirPath: string, interactive: boolean) {
-	const dir = opendirSync(dirPath)
-
-	let entry: Dirent | null = null
-	const failedRenames: string[] = []
-	do {
-		entry = dir.readSync()
-		if (!entry) {
-			break
-		}
-
-		if (!entry.name.endsWith(".mp3") || entry.isDirectory()) {
+async function fixManually(dir: string, results: Map<string, Result<boolean>>) {
+	for (const [filename, result] of results) {
+		const filePath = `${dir}/${filename}`
+		if (result.data) {
 			continue
 		}
 
-		const renameSuccess = await renameFile(path.join(dirPath, entry.name))
-		if (!renameSuccess) {
-			failedRenames.push(entry.name)
+		const mp3Info = Mp3Model.getMp3Info(filePath)
+		if (mp3Info.hasError()) {
+			console.warn(`error could not read info of ${filePath}`)
+			continue
 		}
-	} while (entry !== null)
 
-	if (!interactive) {
-		return
-	}
+		const { tags } = mp3Info.unwrap()
+		if (tags.artist !== "" && tags.title !== "") {
+			return
+		}
 
-	for (const entry of failedRenames) {
-		await renameFileManual(path.join(dirPath, entry))
+		let artist: string = tags.artist
+		let title: string = tags.title
+
+		let artistSuggestion: string | undefined
+		let titleSuggestion: string | undefined
+		const splits = filename.split("-")
+		if (splits.length > 1) {
+			artistSuggestion = splits[0].trim()
+			splits.shift()
+			titleSuggestion = splits.join("-")
+		}
+
+		console.log(`file: ${filePath} is incomplete, please enter info manually.`)
+		if (artist === "") {
+			artist = (
+				await input({ default: artistSuggestion, message: "Enter artist:" })
+			).trim()
+		}
+
+		if (title === "") {
+			title = (
+				await input({ default: titleSuggestion, message: "Enter title:" })
+			).trim()
+		}
+
+		await Mp3Model.setTags(filePath, artist, title)
+		await Mp3Model.fileRename(filePath, artist, title, "mp3")
 	}
 }
 
@@ -115,9 +95,17 @@ export default class Rename extends Command {
 		const fileStats = lstatSync(args.input)
 
 		if (fileStats.isDirectory()) {
-			renameDir(args.input, flags.interactive)
+			const results = await Mp3Model.dirRenameFromTags(args.input)
+			if (flags.interactive) {
+				fixManually(args.input, results)
+			}
 		} else {
-			renameFile(args.input)
+			const result = await Mp3Model.fileRenameFromTags(args.input)
+			if (flags.interactive) {
+				const fileInfo = path.parse(args.input)
+				const filename = `${fileInfo.name}${fileInfo.ext}`
+				fixManually(fileInfo.dir, new Map([[filename, result]]))
+			}
 		}
 	}
 }
